@@ -4,6 +4,7 @@
 #include <cassert>
 #include <iostream>
 #include <fstream>
+#include <sys/stat.h>
 
 #ifndef HAVE_LLVM
 #error "This code needs LLVM enabled"
@@ -146,7 +147,64 @@ public:
             fixpoint = _removeUnusedFromModule();
         } while (fixpoint);
     }
+	// picard add
+    bool getAllVar()
+    {
+        using namespace llvm;
+        // do not slice away these functions no matter what
+        // FIXME do it a vector and fill it dynamically according
+        // to what is the setup (like for sv-comp or general..)
+        const char *keep[] = {options.dgOptions.entryFunction.c_str()};
 
+        // when erasing while iterating the slicer crashes
+        // so set the to be erased values into container
+        // and then erase them
+        std::set<Function *> funs;
+        std::set<GlobalVariable *> globals;
+        std::set<GlobalAlias *> aliases;
+        DebugLoc tmpLoc;
+        int tmp;
+        StringRef * tmps;
+        StringRef modulename;
+        StringRef filename;
+        unsigned line;
+        for (auto I = M->begin(), E = M->end(); I != E; ++I) {
+            Function *func = &*I;
+            modulename = M->getName();
+            for (const BasicBlock& B : *func) {
+                for (const Instruction& I : B) {
+                    const DebugLoc& Loc = I.getDebugLoc();
+                    
+                    
+                    //Make sure that the llvm istruction has corresponding dbg LOC
+    #if ((LLVM_VERSION_MAJOR > 3)\
+        || ((LLVM_VERSION_MAJOR == 3) && (LLVM_VERSION_MINOR > 6)))
+                    if (Loc)
+    #else
+                    if (Loc.getLine() > 0)
+    #endif          
+                    {
+                        line = Loc.getLine();
+                        const DILocation *test = Loc.get();
+                        filename = test->getFilename();
+                    }
+                }
+            }
+        }
+
+        for (auto I = M->global_begin(), E = M->global_end(); I != E; ++I) {
+            GlobalVariable *gv = &*I;
+            if (gv->hasNUses(0))
+                globals.insert(gv);
+        }
+
+        for (GlobalAlias& ga : M->getAliasList()) {
+            if (ga.hasNUses(0))
+                aliases.insert(&ga);
+        }
+
+        return true;
+    }
     // after we slice the LLVM, we somethimes have troubles
     // with function declarations:
     //
@@ -431,7 +489,122 @@ static AnnotationOptsT parseAnnotationOptions(const std::string& annot)
 
     return opts;
 }
+static std::string getBBName(const llvm::BasicBlock &B){
+    using namespace llvm;
+    int line,col;
+    std::string filename;
+    std::string bb_name("");
+    for(const Instruction&I:B){
+        const DebugLoc& Loc = I.getDebugLoc();
+#if ((LLVM_VERSION_MAJOR > 3)\
+    || ((LLVM_VERSION_MAJOR == 3) && (LLVM_VERSION_MINOR > 6)))
+                if (Loc)
+#else
+                if (Loc.getLine() > 0)
+#endif   
+        {
+            line = Loc.getLine();
+            col = Loc.getCol();
+            const DILocation *dil = Loc.get();
+            filename =  dil->getFilename().str();
+            bb_name = filename+":"+std::to_string(line)+":"+std::to_string(col);
+            return bb_name;
+        }
+    }
+    return bb_name;
+}
+static std::string bbRecord(const llvm::BasicBlock &BB) {
+    using namespace llvm;
+	std::string id_str="";
+	std::string loc_str="";
+	std::string bb_cnt_str="";
+	//id_str=";";
+	id_str=getBBName(BB)+";";
+	for (auto pit = pred_begin(&BB), pet = pred_end(&BB); pit != pet; ++pit)
+	{
+		const BasicBlock* predecessor = *pit;
+		if (id_str[id_str.size()-1]==';'){
+			id_str+= getBBName(*predecessor);
+		}else{
+			id_str+= ","+getBBName(*predecessor);
+		}
+		id_str+= "{";
+		for (auto pit2 = pred_begin(predecessor), pet2 = pred_end(predecessor); pit2 != pet2; ++pit2)
+		{
+			const BasicBlock* pred_pred = *pit2;
+			if (id_str[id_str.size()-1]=='{'){
+				id_str+=getBBName(*pred_pred);
+			}else{
+				id_str+="#"+getBBName(*pred_pred);
+			}
+			id_str+="(";
+			for (auto pit3 = pred_begin(pred_pred), pet3 = pred_end(pred_pred); pit3 != pet3; ++pit3)
+			{
+				const BasicBlock* pred_pred_pred = *pit3;
+				if (id_str[id_str.size()-1]=='('){
+					id_str+=getBBName(*pred_pred_pred);
+				}else{
+					id_str+="&"+getBBName(*pred_pred_pred);
+				}
+			}
+			if (id_str[id_str.size()-1]=='('){
+				id_str=id_str.substr(0,id_str.size()-1);
+			}else{
+				id_str+= ")";
+			}
+		}
+		if (id_str[id_str.size()-1]=='{'){
+			id_str=id_str.substr(0,id_str.size()-1);
+		}else{
+			id_str+= "}";
+		}
+	}
+	id_str+=";";
+	const TerminatorInst *TI = BB.getTerminator();
+	for (auto *sit : TI->successors())//for (BasicBlock *Succ : TI->successors())
+	{
+		if(id_str[id_str.size()-1]==';'){
+			id_str+= getBBName(*sit);
+		}else{
+			id_str+="," + getBBName(*sit);
+		}
+	}
+	return id_str;
+}
+static std::string bb_out_edges(const llvm::BasicBlock &BB) {
+    using namespace llvm;
+	std::string id_str="";
+	const TerminatorInst *TI = BB.getTerminator();
+	for (auto *sit : TI->successors())//for (BasicBlock *Succ : TI->successors())
+	{
+		id_str+=getBBName(BB) + "," + getBBName(*sit)+"\n";
+	}
+	return id_str;
+}
+static void getBasicBlock(const llvm::Module *M)
+{
 
+	std::string func_dir="sliced_cfgs";
+	struct stat sb;
+	if (stat(func_dir.c_str(), &sb) != 0) {
+		const int dir_err = mkdir(func_dir.c_str(),
+				S_IRWXU | S_IRWXG | S_IROTH | S_IXOTH);
+		if (-1 == dir_err)
+			llvm::errs()<<"Could not create directory "<<func_dir<<".\n";
+	}
+    for (const llvm::Function& F : *M) {
+    	std::string func_name=F.getName().str();
+    	std::ofstream fs_out;
+    	fs_out.open(func_dir+"/"+func_name+".txt",std::ios::app);
+    	if(!fs_out)
+            llvm::errs()<<"Error! Cannot open:"<<func_name << ".txt\n";
+    	for (const llvm::BasicBlock& B : F) {
+            //fs_out<<bbRecord(B)<<"\n";
+    		fs_out<<bb_out_edges(B);
+        }
+    	fs_out.close();
+    }
+}
 std::unique_ptr<llvm::Module> parseModule(llvm::LLVMContext& context,
                                           const SlicerOptions& options)
 {
@@ -584,7 +757,8 @@ int main(int argc, char *argv[])
         errs() << "ERROR: Slicing failed\n";
         return 1;
     }
-
+	slicer.show_dependency();
+	getBasicBlock(M.get());
     if (dump_dg) {
         dumper.dumpToDot(".sliced.dot");
     }

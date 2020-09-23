@@ -1,76 +1,22 @@
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
+*
 
-# Precompiled Headers
-*.gch
-*.pch
+!*/
 
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Fortran module files
-*.mod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
-*.lib
-
-# Executables
-*.exe
-*.out
-*.app
-
-# cmake
-*.cmake
-*Makefile*
-
-# swp files
-*.swp
-*.swo
-*.swm
-
-# vim config files
-*.vimrc
-
-tags
-*/tags
-*/cscope.out
-
-*.swn
-*.dot
-*.ps
-
-# LLVM files
-*.bc
-*.sliced
-
-*.i
-
-tests/*-test
-
-# C files in tools are test codes
-tools/*.c
-tools/*.bc
-
-tools/llvm-dg-dump
-tools/llvm-to-source
-tools/llvm-slicer
-
-git-version.h
-
-#build directory
-build
-
-#sourcetrail files
-dg.srctrl*
-
-compile_commands.json
-
-CMakeLists.txt.user*
+doc/
+lib/
+CMakeFiles/
+!*.c++
+!*.cc
+!*.cp
+!*.cpp
+!*.cxx
+!*.h
+!*.h++
+!*.hh
+!*.hp
+!*.hpp
+!*.hxx
+!*.C
+!*.H
+!*.c
+tools/git-version.h 

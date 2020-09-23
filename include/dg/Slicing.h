@@ -13,6 +13,13 @@
 #include "dg/BBlock.h"
 #endif
 
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/Value.h>
+#include <llvm/IR/Instruction.h>
+#include <llvm/IR/GlobalVariable.h>
+#include <llvm/IR/Instructions.h>
+#include <llvm/IR/InstIterator.h>
+#include <llvm/Support/raw_ostream.h>
 namespace dg {
 
 // this class will go through the nodes
@@ -104,7 +111,19 @@ private:
         }
     }
 };
-
+struct DependencyItem{
+    int line;
+    int col;
+    std::string filename;
+    friend bool operator==(const DependencyItem & d1,const DependencyItem & d2){
+        return (d1.line == d2.line && d1.filename == d2.filename);
+    }  
+    friend bool operator<(const DependencyItem & d1,const DependencyItem & d2){
+        if(d1.filename == d2.filename)
+            return d1.line<d2.line;
+        return (d1.filename < d2.filename);
+    }  
+};
 struct SlicerStatistics
 {
     SlicerStatistics()
@@ -117,6 +136,7 @@ struct SlicerStatistics
     uint64_t nodesRemoved;
     // number of whole blocks removed
     uint32_t blocksRemoved;
+	std::set<DependencyItem> dependency;
 };
 
 template <typename NodeT>

@@ -22,7 +22,10 @@
 #include <llvm/IR/Instruction.h>
 #include <llvm/IR/GlobalVariable.h>
 #include <llvm/IR/Instructions.h>
+#include <llvm/IR/InstIterator.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/DebugInfoMetadata.h>
 
 #if (__clang__)
 #pragma clang diagnostic pop // ignore -Wunused-parameter
@@ -137,7 +140,34 @@ public:
         assert(0 && "Do not use this method with LLVM dg");
         return 0;
     }
-
+    uint32_t show_dependency(){
+        int line;
+        std::string filename;
+        llvm::errs() << "Dependency List:\n";
+        for (auto& it : constructedFunctions) {
+            for (auto& I : llvm::instructions(*llvm::cast<llvm::Function>(it.first))) {
+                const llvm::DebugLoc& Loc = I.getDebugLoc();
+                if (!Loc) {
+                continue;
+                }
+                DependencyItem tmpItem;
+                tmpItem.line = Loc.getLine();
+                tmpItem.col = Loc.getCol();
+                const llvm::DILocation *dil = Loc.get();
+                std::string filename = dil->getFilename().str();
+                tmpItem.filename = filename;
+                //llvm::errs() << "dependency line is "<<Loc.getLine()<<" \n";
+                statistics.dependency.insert(tmpItem);
+            }
+        }
+        std::set<DependencyItem>::iterator it;
+        llvm::errs() << "<filename>:<line>:<column>\n";
+        for(it=statistics.dependency.begin();it!=statistics.dependency.end();it++)
+        {
+            llvm::errs() << (*it).filename << ":" << (*it).line << ":" << (*it).col << "\n";
+        }
+        return 0;
+    }
     uint32_t slice(LLVMDependenceGraph *,
                    LLVMNode *start, uint32_t sl_id = 0)
     {
@@ -158,7 +188,21 @@ public:
 
         return sl_id;
     }
-
+    uint32_t showinstruct(LLVMDependenceGraph *)
+    {
+        // take every subgraph and prt instruction
+        // this includes the main graph
+        for (auto& it : constructedFunctions) {
+            LLVMDependenceGraph *subdg = it.second;
+            for(auto I = subdg->begin(), E = subdg->end(); I != E;){
+                LLVMNode *n = I->second;
+                ++I;
+                showOneInstruct(n->getKey());
+                llvm::errs() << "this is inst"<<" \n";
+            }
+        }
+        return 0;
+    }
 private:
         /*
     void sliceCallNode(LLVMNode *callNode,
@@ -231,7 +275,14 @@ private:
                 return true;
         }
     }
-
+    static inline bool showOneInstruct(const llvm::Value *val)
+    {
+        using namespace llvm;
+        const Instruction *Inst = dyn_cast<Instruction>(val);
+        if (!Inst)
+            return true;
+        llvm::errs() << "show one inst"<<" \n";
+    }
     static LLVMBBlock *
     createNewExitBB(LLVMDependenceGraph *graph)
     {
@@ -487,9 +538,11 @@ private:
 
     bool dontTouch(const llvm::StringRef& r)
     {
-        for (const char *n : dont_touch)
+        for (const char *n : dont_touch){
+
             if (r.equals(n))
                 return true;
+        }
 
         return false;
     }

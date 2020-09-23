@@ -152,7 +152,10 @@ public:
 
         return true;
     }
-
+    virtual uint32_t show_dependency(){
+        slicer.show_dependency();
+        return 0;
+    }
     bool slice()
     {
         assert(_dg && "Must run buildDG() and computeDependencies()");
