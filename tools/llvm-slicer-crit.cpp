@@ -248,7 +248,7 @@ void getFileLineCriteriaNodes(LLVMDependenceGraph& dg,
                     std::string filename = dil->getFilename().str();
                     if(filename != c.filename)
                         continue;
-                    if (isStoreToTheVar(dg, I, c.varname) || isLoadOfTheVar(dg, I, c.varname)) {
+                    if (isStoreToTheVar(dg, I, c.varname) || isLoadOfTheVar(dg, I, c.varname || !c.varname.compare("NULL"))) {
                             llvm::errs() << "Matched file " << c.filename << " with linecnt "<< c.linenum <<" var "<<c.varname<< " to:\n" << I << "\n";
                             LLVMNode *nd = it.second->getNode(&I);
                             assert(nd);
