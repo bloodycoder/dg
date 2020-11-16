@@ -1,341 +1,410 @@
+#include <vector>
+#include <cassert>
+
+// ignore unused parameters in LLVM libraries
+#if (__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-parameter"
+#else
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#endif
+
+#include <llvm/IR/Instruction.h>
+#include <llvm/IR/Instructions.h>
+#include <llvm/IR/IntrinsicInst.h>
+#include <llvm/IR/Function.h>
+#include <llvm/IR/DataLayout.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/Constant.h>
+#include <llvm/Support/raw_os_ostream.h>
+
+#if (__clang__)
+#pragma clang diagnostic pop // ignore -Wunused-parameter
+#else
+#pragma GCC diagnostic pop
+#endif
+
 #include "dg/llvm/PointerAnalysis/PointerGraph.h"
+
+#include "llvm/ReadWriteGraph/LLVMReadWriteGraphBuilder.h"
 #include "llvm/llvm-utils.h"
 
 namespace dg {
-namespace pta {
+namespace dda {
 
-// create subgraph or add edges to already existing subgraph,
-// return the CALL node (the first) and the RETURN node (the second),
-// so that we can connect them into the PointerGraph
-LLVMPointerGraphBuilder::PSNodesSeq&
-LLVMPointerGraphBuilder::createCall(const llvm::Instruction *Inst) {
-    using namespace llvm;
+static void reportIncompatibleCalls(const std::set<const llvm::Function *>& incompatibleCalls,
+                                    const llvm::CallInst *CInst,
+                                    size_t tried_num) {
 
-    const CallInst *CInst = cast<CallInst>(Inst);
-    const Value *calledVal = CInst->getCalledValue()->stripPointerCasts();
-
-    if (CInst->isInlineAsm()) {
-        return createAsm(Inst);
+    if (incompatibleCalls.empty()) {
+        return;
     }
 
-    if (const Function *func = dyn_cast<Function>(calledVal)) {
-        return createFunctionCall(CInst, func);
-    } else {
-        // this is a function pointer call
-        return createFuncptrCall(CInst, calledVal);
+#ifndef NDEBUG
+    llvm::errs() << "[RWG] warning: incompatible function pointers for "
+                 << ValInfo(CInst) << "\n";
+
+    for (auto *F : incompatibleCalls) {
+        llvm::errs() << "   Tried: " << F->getName() << " of type "
+                     << *F->getType() << "\n";
+    }
+#endif
+    if (incompatibleCalls.size() == tried_num) {
+        llvm::errs() << "[RWG] error: did not find any compatible function "
+                        "pointer for " << ValInfo(CInst) << "\n";
     }
 }
 
-LLVMPointerGraphBuilder::PSNodesSeq&
-LLVMPointerGraphBuilder::createFunctionCall(const llvm::CallInst *CInst, const llvm::Function *func)
-{
-    // is it a call to free? If so, create invalidate node instead.
-    if(invalidate_nodes && func->getName().equals("free")) {
-        return createFree(CInst);
-    } else if (threads_) {
-        if (func->getName().equals("pthread_create")) {
-           return createPthreadCreate(CInst);
-        } else if (func->getName().equals("pthread_join")) {
-           return createPthreadJoin(CInst);
-        } else if (func->getName().equals("pthread_exit")) {
-           return createPthreadExit(CInst);
+NodesSeq<RWNode>
+LLVMReadWriteGraphBuilder::createCallToFunctions(
+                            const std::vector<const llvm::Function *> &functions,
+                            const llvm::CallInst *CInst) {
+
+    assert(!functions.empty() && "No functions to call");
+
+    std::set<const llvm::Function *> incompatibleCalls;
+    std::vector<RWNode *> called_values;
+    std::vector<RWSubgraph *> called_subgraphs;
+    for (auto *F : functions) {
+        if (!llvmutils::callIsCompatible(F, CInst)) {
+            incompatibleCalls.insert(F);
+            continue;
+        }
+
+        if (auto model = _options.getFunctionModel(F->getName().str())) {
+            called_values.push_back(funcFromModel(model, CInst));
+        } else if (F->isDeclaration()) {
+            called_values.push_back(createCallToUndefinedFunction(F, CInst));
+        } else {
+            auto *s = getSubgraph(F);
+            assert(s && "Do not have a subgraph for a function");
+            called_subgraphs.push_back(s);
         }
     }
 
-    // is function undefined? If so it can be
-    // intrinsic, memory allocation (malloc, calloc,...)
-    // or just undefined function
-    // NOTE: we first need to check whether the function
-    // is undefined and after that if it is memory allocation,
-    // because some programs may define function named
-    // 'malloc' etc.
-    if (func->size() == 0) {
-        /// memory allocation (malloc, calloc, etc.)
-        auto type =_options.getAllocationFunction(func->getName());
-        if (type != AllocationFunction::NONE) {
-            return createDynamicMemAlloc(CInst, type);
-        } else if (func->isIntrinsic()) {
-            return createIntrinsic(CInst);
-        } else
+    reportIncompatibleCalls(incompatibleCalls, CInst, functions.size());
+
+    // if we call just one undefined function, simplify the graph and
+    // do not create a CALL node -- just put the already created node there
+    if (called_subgraphs.empty() && called_values.size() == 1) {
+        return {called_values[0]};
+    } else {
+        RWNodeCall *callNode = RWNodeCall::get(&create(RWNodeType::CALL));
+        for (auto *item : called_subgraphs)
+            callNode->addCallee(item);
+        for (auto *item : called_values)
+            callNode->addCallee(item);
+        return {callNode};
+    }
+}
+
+RWNode *LLVMReadWriteGraphBuilder::createUnknownCall(const llvm::CallInst *CInst) {
+    using namespace llvm;
+
+    RWNode *node = &create(RWNodeType::GENERIC);
+
+    // if we assume that undefined functions are pure
+    // (have no side effects), we can bail out here
+    if (_options.undefinedArePure())
+        return node;
+
+    bool args = false;
+    if (_options.undefinedFunsReadAny()) {
+        node->addUse(UNKNOWN_MEMORY);
+    } else {
+        args |= _options.undefinedFunsReadArgs();
+    }
+
+    if (_options.undefinedFunsWriteAny()) {
+        node->addDef(UNKNOWN_MEMORY);
+    } else {
+        args |= _options.undefinedFunsWriteArgs();
+    }
+
+    if (!args)
+        return node;
+
+    // every pointer we pass into the undefined call may be defined
+    // in the function
+    for (unsigned int i = 0; i < CInst->getNumArgOperands(); ++i) {
+        const Value *llvmOp = CInst->getArgOperand(i);
+
+        // constants cannot be redefined except for global variables
+        // (that are constant, but may point to non constant memory
+        const Value *strippedValue = llvmOp->stripPointerCasts();
+        if (isa<Constant>(strippedValue)) {
+            const GlobalVariable *GV = dyn_cast<GlobalVariable>(strippedValue);
+            // if the constant is not global variable,
+            // or the global variable points to constant memory
+            if (!GV || GV->isConstant())
+                continue;
+        }
+
+        auto pts = PTA->getLLVMPointsToChecked(llvmOp);
+        // if we do not have a pts, this is not pointer
+        // relevant instruction. We must do it this way
+        // instead of type checking, due to the inttoptr.
+        if (!pts.first)
+            continue;
+
+        for (const auto& ptr : pts.second) {
+            if (llvm::isa<llvm::Function>(ptr.value))
+                // function may not be redefined
+                continue;
+
+            RWNode *target = getOperand(ptr.value);
+            if(!target) continue;
+            //assert(target && "Don't have pointer target for call argument");
+
+            // this call may use and define this memory
+            if (_options.undefinedFunsWriteArgs() && !_options.undefinedFunsWriteAny())
+                node->addDef(target, Offset::UNKNOWN, Offset::UNKNOWN);
+            if (_options.undefinedFunsReadArgs() && !_options.undefinedFunsReadAny())
+                node->addUse(target, Offset::UNKNOWN, Offset::UNKNOWN);
+        }
+    }
+
+    return node;
+}
+
+
+/*
+void LLVMReadWriteGraphBuilder::matchForksAndJoins()
+{
+    using namespace llvm;
+    using namespace pta;
+
+    ForkJoinAnalysis FJA{PTA};
+
+    for (auto& it : threadJoinCalls) {
+        // it.first -> llvm::CallInst, it.second -> RWNode *
+        auto functions = FJA.joinFunctions(it.first);
+        for (auto llvmFunction : functions) {
+            auto graphIterator = subgraphs_map.find(llvmFunction);
+            for (auto returnNode : graphIterator->second.returns) {
+                makeEdge(returnNode, it.second);
+            }
+        }
+    }
+}
+*/
+
+RWNode *LLVMReadWriteGraphBuilder::createIntrinsicCall(const llvm::CallInst *CInst)
+{
+    using namespace llvm;
+
+    const IntrinsicInst *I = cast<IntrinsicInst>(CInst);
+    const Value *dest;
+    const Value *lenVal;
+
+    RWNode *ret;
+    switch (I->getIntrinsicID())
+    {
+        case Intrinsic::memmove:
+        case Intrinsic::memcpy:
+        case Intrinsic::memset:
+            // memcpy/set <dest>, <src/val>, <len>
+            dest = I->getOperand(0);
+            lenVal = I->getOperand(2);
+            break;
+        case Intrinsic::vastart:
+            // we create this node because this nodes works
+            // as ALLOC in points-to, so we can have
+            // reaching definitions to that
+            ret = &create(RWNodeType::ALLOC);
+            ret->addDef(ret, 0, Offset::UNKNOWN);
+            return ret;
+        default:
             return createUnknownCall(CInst);
     }
 
-    return createCallToFunction(CInst, func);
-}
+    ret = &create(RWNodeType::GENERIC);
 
-LLVMPointerGraphBuilder::PSNodesSeq&
-LLVMPointerGraphBuilder::createFuncptrCall(const llvm::CallInst *CInst, const llvm::Value *calledVal)
-{
-    // just the call_funcptr and call_return nodes are created and
-    // when the pointers are resolved during analysis, the graph
-    // will be dynamically created and it will replace these nodes
-    PSNode *op = getOperand(calledVal);
-    PSNode *call_funcptr = PS.create(PSNodeType::CALL_FUNCPTR, op);
-    PSNode *ret_call = PS.create(PSNodeType::CALL_RETURN, nullptr);
-
-    ret_call->setPairedNode(call_funcptr);
-    call_funcptr->setPairedNode(ret_call);
-
-    call_funcptr->setUserData(const_cast<llvm::CallInst *>(CInst));
-
-    return addNode(CInst, {call_funcptr, ret_call});
-}
-
-LLVMPointerGraphBuilder::PSNodesSeq&
-LLVMPointerGraphBuilder::createUnknownCall(const llvm::CallInst *CInst) {
-    // This assertion must not hold if the call is wrapped
-    // inside bitcast - it defaults to int, but is bitcased
-    // to pointer
-    //assert(CInst->getType()->isPointerTy());
-    PSNode *call = PS.create(PSNodeType::CALL, nullptr);
-    call->setPairedNode(call);
-
-    // the only thing that the node will point at
-    call->addPointsTo(UnknownPointer);
-
-    return addNode(CInst, call);
-}
-
-LLVMPointerGraphBuilder::PSNodesSeq&
-LLVMPointerGraphBuilder::createMemTransfer(const llvm::IntrinsicInst *I) {
-    using namespace llvm;
-    const Value *dest, *src;//, *lenVal;
-    uint64_t lenVal = Offset::UNKNOWN;
-
-    switch (I->getIntrinsicID()) {
-        case Intrinsic::memmove:
-        case Intrinsic::memcpy:
-            dest = I->getOperand(0);
-            src = I->getOperand(1);
-            lenVal = llvmutils::getConstantValue(I->getOperand(2));
-            break;
-        default:
-            errs() << "ERR: unhandled mem transfer intrinsic" << *I << "\n";
-            abort();
+    auto pts = PTA->getLLVMPointsToChecked(dest);
+    if (!pts.first) {
+        llvm::errs() << "[RD] Error: No points-to information for destination in\n";
+        llvm::errs() << ValInfo(I) << "\n";
+        // continue, the points-to set is {unknown}
     }
 
-    PSNode *destNode = getOperand(dest);
-    PSNode *srcNode = getOperand(src);
-    PSNode *node = PS.create(PSNodeType::MEMCPY,
-                              srcNode, destNode, lenVal);
+    uint64_t len = Offset::UNKNOWN;
+    if (const ConstantInt *C = dyn_cast<ConstantInt>(lenVal))
+        len = C->getLimitedValue();
 
-    return addNode(I, node);
-}
+    for (const auto& ptr : pts.second) {
+        if (llvm::isa<llvm::Function>(ptr.value))
+            continue;
 
-LLVMPointerGraphBuilder::PSNodesSeq&
-LLVMPointerGraphBuilder::createMemSet(const llvm::Instruction *Inst) {
-    PSNode *val;
-    if (llvmutils::memsetIsZeroInitialization(llvm::cast<llvm::IntrinsicInst>(Inst)))
-        val = NULLPTR;
-    else
-        // if the memset is not 0-initialized, it does some
-        // garbage into the pointer
-        val = UNKNOWN_MEMORY;
+        Offset from, to;
+        if (ptr.offset.isUnknown()) {
+            // if the offset is UNKNOWN, use whole memory
+            from = Offset::UNKNOWN;
+            len = Offset::UNKNOWN;
+        } else {
+            from = *ptr.offset;
+        }
 
-    PSNode *op = getOperand(Inst->getOperand(0)->stripInBoundsOffsets());
-    // we need to make unknown offsets
-    PSNode *G = PS.create(PSNodeType::GEP, op, Offset::UNKNOWN);
-    PSNode *S = PS.create(PSNodeType::STORE, val, G);
+        // do not allow overflow
+        if (Offset::UNKNOWN - *from > len)
+            to = from + len;
+        else
+            to = Offset::UNKNOWN;
 
-    PSNodesSeq ret(G);
-    ret.append(S);
-    // no representant here...
+        RWNode *target = getOperand(ptr.value);
+        //assert(target && "Don't have pointer target for intrinsic call");
+        if (!target) {
+            // keeping such set is faster then printing it all to terminal
+            // ... and we don't flood the terminal that way
+            static std::set<const llvm::Value *> warned;
+            if (warned.insert(ptr.value).second) {
+                llvm::errs() << "[RD] error at " << ValInfo(CInst) << "\n"
+                             << "[RD] error: Haven't created node for: "
+                             << ValInfo(ptr.value) << "\n";
+            }
+            target = UNKNOWN_MEMORY;
+        }
 
-    return addNode(Inst, ret);
-}
-
-LLVMPointerGraphBuilder::PSNodesSeq&
-LLVMPointerGraphBuilder::createVarArg(const llvm::IntrinsicInst *Inst) {
-    // just store all the pointers from vararg argument
-    // to the memory given in vastart() on Offset::UNKNOWN.
-    // It is the easiest thing we can do without any further
-    // analysis
-    PSNodesSeq ret;
-
-    // first we need to get the vararg argument phi
-    const llvm::Function *F = Inst->getParent()->getParent();
-    PointerSubgraph *subg = subgraphs_map[F];
-    assert(subg);
-    PSNode *arg = subg->vararg;
-    assert(F->isVarArg() && "vastart in a non-variadic function");
-    assert(arg && "Don't have variadic argument in a variadic function");
-
-    // vastart will be node that will keep the memory
-    // with pointers, its argument is the alloca, that
-    // alloca will keep pointer to vastart
-    PSNode *vastart = PS.create(PSNodeType::ALLOC);
-
-    // vastart has only one operand which is the struct
-    // it uses for storing the va arguments. Strip it so that we'll
-    // get the underlying alloca inst
-    PSNode *op = getOperand(Inst->getOperand(0)->stripInBoundsOffsets());
-    // the argument is usually an alloca, but it may be a load
-    // in the case the code was transformed by -reg2mem
-    assert((op->getType() == PSNodeType::ALLOC || op->getType() == PSNodeType::LOAD)
-           && "Argument of vastart is invalid");
-    // get node with the same pointer, but with Offset::UNKNOWN
-    // FIXME: we're leaking it
-    // make the memory in alloca point to our memory in vastart
-    PSNode *ptr = PS.create(PSNodeType::GEP, op, Offset::UNKNOWN);
-    PSNode *S1 = PS.create(PSNodeType::STORE, vastart, ptr);
-    // and also make vastart point to the vararg args
-    PSNode *S2 = PS.create(PSNodeType::STORE, arg, vastart);
-
-    ret.append(vastart);
-    ret.append(ptr);
-    ret.append(S1);
-    ret.append(S2);
-
-    ret.setRepresentant(vastart);
-
-    return addNode(Inst, ret);
-}
-
-LLVMPointerGraphBuilder::PSNodesSeq&
-LLVMPointerGraphBuilder::createIntrinsic(const llvm::Instruction *Inst) {
-    using namespace llvm;
-
-    const IntrinsicInst *I = cast<IntrinsicInst>(Inst);
-    if (isa<MemTransferInst>(I)) {
-        return createMemTransfer(I);
-    } else if (isa<MemSetInst>(I)) {
-        return createMemSet(I);
+        // add the definition
+        ret->addDef(target, from, to, !from.isUnknown() && !to.isUnknown() /* strong update */);
     }
 
-    switch (I->getIntrinsicID()) {
-        case Intrinsic::vastart:
-            return createVarArg(I);
-        case Intrinsic::stacksave:
-            errs() << "WARNING: Saving stack may yield unsound results!: "
-                   << *Inst << "\n";
-            return createAlloc(Inst);
-        case Intrinsic::stackrestore:
-            return createLoad(Inst);
-        case Intrinsic::lifetime_end:
-            return createLifetimeEnd(Inst);
-        default:
-            errs() << *Inst << "\n";
-            errs() << "Unhandled intrinsic ^^\n";
-            abort();
-    }
+    return ret;
 }
 
-LLVMPointerGraphBuilder::PSNodesSeq&
-LLVMPointerGraphBuilder::createAsm(const llvm::Instruction *Inst) {
-    // we filter irrelevant calls in isRelevantCall()
-    // and we don't have assembler there at all. If
-    // we are here, then we got here because this
-    // is undefined call that returns pointer.
-    // In this case return an unknown pointer
-    static bool warned = false;
-    if (!warned) {
-        llvm::errs() << "PTA: Inline assembly found, analysis  may be unsound\n";
-        warned = true;
-    }
+template <typename T>
+std::pair<Offset, Offset> getFromTo(const llvm::CallInst *CInst, T what) {
+    auto from = what->from.isOperand()
+                ? llvmutils::getConstantValue(CInst->getArgOperand(what->from.getOperand()))
+                  : what->from.getOffset();
+    auto to = what->to.isOperand()
+                ? llvmutils::getConstantValue(CInst->getArgOperand(what->to.getOperand()))
+                  : what->to.getOffset();
 
-    PSNode *n = PS.create(PSNodeType::CONSTANT, UNKNOWN_MEMORY, Offset::UNKNOWN);
-    // it is call that returns pointer, so we'd like to have
-    // a 'return' node that contains that pointer
-    n->setPairedNode(n);
-    return addNode(Inst, n);
+    return {from, to};
 }
 
-LLVMPointerGraphBuilder::PSNodesSeq&
-LLVMPointerGraphBuilder::createFree(const llvm::Instruction *Inst) {
+RWNode *LLVMReadWriteGraphBuilder::funcFromModel(const FunctionModel *model,
+                                                 const llvm::CallInst *CInst) {
 
-    PSNode *op1 = getOperand(Inst->getOperand(0));
-    PSNode *node = PS.create(PSNodeType::FREE, op1);
+    RWNode *node = &create(RWNodeType::GENERIC);
 
-    return addNode(Inst, node);
-}
+    for (unsigned int i = 0; i < CInst->getNumArgOperands(); ++i) {
+        if (!model->handles(i))
+            continue;
 
-LLVMPointerGraphBuilder::PSNodesSeq&
-LLVMPointerGraphBuilder::createDynamicAlloc(const llvm::CallInst *CInst,
-                                            AllocationFunction type) {
-    using namespace llvm;
+        const auto llvmOp = CInst->getArgOperand(i);
+        auto pts = PTA->getLLVMPointsToChecked(llvmOp);
+        // if we do not have a pts, this is not pointer
+        // relevant instruction. We must do it this way
+        // instead of type checking, due to the inttoptr.
+        if (!pts.first) {
+            llvm::errs() << "[Warning]: did not find pt-set for modeled function\n";
+            llvm::errs() << "           Func: " << model->name << ", operand " << i << "\n";
+            continue;
+        }
 
-    const Value *op;
-    uint64_t size = 0, size2 = 0;
-    PSNodeAlloc *node = PSNodeAlloc::get(PS.create(PSNodeType::ALLOC));
-    node->setIsHeap();
+        for (const auto& ptr : pts.second) {
+            if (llvm::isa<llvm::Function>(ptr.value))
+                // functions may not be redefined
+                continue;
 
-    switch (type) {
-        case AllocationFunction::MALLOC:
-            node->setIsHeap();
-            /* fallthrough */
-        case AllocationFunction::ALLOCA:
-            op = CInst->getOperand(0);
-            break;
-        case AllocationFunction::CALLOC:
-            node->setIsHeap();
-            node->setZeroInitialized();
-            op = CInst->getOperand(1);
-            break;
-        default:
-            errs() << *CInst << "\n";
-            assert(0 && "unknown memory allocation type");
-            // for NDEBUG
-            abort();
-    };
+            RWNode *target = getOperand(ptr.value);
+            if(!target) continue;
+            assert(target && "Don't have pointer target for call argument");
 
-    // infer allocated size
-    size = llvmutils::getConstantSizeValue(op);
-    if (size != 0 && type == AllocationFunction::CALLOC) {
-        // if this is call to calloc, the size is given
-        // in the first argument too
-        size2 = llvmutils::getConstantSizeValue(CInst->getOperand(0));
-        // if both ops are constants, multiply them to get
-        // the correct size, otherwise return 0 (unknown)
-        size = size2 != 0 ? size * size2 : 0;
+            Offset from, to;
+            if (auto defines = model->defines(i)) {
+                std::tie(from, to) = getFromTo(CInst, defines);
+                // this call may define this memory
+                bool strong_updt = pts.second.size() == 1 &&
+                                   !ptr.offset.isUnknown() &&
+                                   !(ptr.offset + from).isUnknown() &&
+                                   !(ptr.offset + to).isUnknown() &&
+                                   !llvm::isa<llvm::CallInst>(ptr.value);
+                // FIXME: what about vars in recursive functions?
+                node->addDef(target, ptr.offset + from, ptr.offset + to, strong_updt);
+            }
+            if (auto uses = model->uses(i)) {
+                std::tie(from, to) = getFromTo(CInst, uses);
+                // this call uses this memory
+                node->addUse(target, ptr.offset + from, ptr.offset + to);
+            }
+        }
     }
 
-    node->setSize(size);
-    return addNode(CInst, node);
+    return node;
 }
+RWNode *
+LLVMReadWriteGraphBuilder::createCallToUndefinedFunction(const llvm::Function *function,
+                                                         const llvm::CallInst *CInst) {
+    if (function->isIntrinsic()) {
+        return createIntrinsicCall(CInst);
+    }
+    if (_options.threads) {
+        assert(false && "Threads unsupported yet");
+        /*
+        if (function->getName() == "pthread_create") {
+            return createPthreadCreateCalls(CInst);
+        } else if (function->getName() == "pthread_join") {
+            return createPthreadJoinCall(CInst);
+        } else if (function->getName() == "pthread_exit") {
+            return createPthreadExitCall(CInst);
+        }
+        */
+    }
 
-LLVMPointerGraphBuilder::PSNodesSeq&
-LLVMPointerGraphBuilder::createRealloc(const llvm::CallInst *CInst) {
-    using namespace llvm;
-
-    PSNodesSeq ret;
-
-    // we create new allocation node and memcpy old pointers there
-    PSNode *orig_mem = getOperand(CInst->getOperand(0));
-    PSNodeAlloc *reall = PSNodeAlloc::get(PS.create(PSNodeType::ALLOC));
-    reall->setIsHeap();
-    reall->setUserData(const_cast<llvm::CallInst *>(CInst));
-
-    // copy everything that is in orig_mem to reall
-    PSNode *mcp = PS.create(PSNodeType::MEMCPY, orig_mem, reall, Offset::UNKNOWN);
-    // we need the pointer in the last node that we return
-    PSNode *ptr = PS.create(PSNodeType::CONSTANT, reall, 0);
-
-    reall->setIsHeap();
-    reall->setSize(llvmutils::getConstantSizeValue(CInst->getOperand(1)));
-
-    ret.append(reall);
-    ret.append(mcp);
-    ret.append(ptr);
-    ret.setRepresentant(ptr);
-
-    return addNode(CInst, ret);
-}
-
-LLVMPointerGraphBuilder::PSNodesSeq&
-LLVMPointerGraphBuilder::createDynamicMemAlloc(const llvm::CallInst *CInst,
-                                               AllocationFunction type) {
-    assert(type != AllocationFunction::NONE
-            && "BUG: creating dyn. memory node for NONMEM");
-
-    if (type == AllocationFunction::REALLOC) {
-        return createRealloc(CInst);
+    auto type = _options.getAllocationFunction(function->getName().str());
+    if (type != AllocationFunction::NONE) {
+        if (type == AllocationFunction::REALLOC)
+            return createRealloc(CInst);
+        else
+            return createDynAlloc(CInst, type);
     } else {
-        return createDynamicAlloc(CInst, type);
+        return createUnknownCall(CInst);
     }
+
+    assert(false && "Unreachable");
+    abort();
 }
 
+/*
+RWNode *LLVMReadWriteGraphBuilder::createPthreadCreateCalls(const llvm::CallInst *CInst) {
+    using namespace llvm;
+
+    RWNode *rootNode = &create(RWNodeType::FORK);
+    threadCreateCalls.emplace(CInst, rootNode);
+
+    Value *calledValue = CInst->getArgOperand(2);
+    const auto& functions = getCalledFunctions(calledValue, PTA);
+
+    for (const Function *function : functions) {
+        if (function->isDeclaration()) {
+            llvm::errs() << "[RD] error: phtread_create spawns undefined function: "
+                         << function->getName() << "\n";
+            continue;
+        }
+    }
+    return rootNode;
+}
+
+RWNode *LLVMReadWriteGraphBuilder::createPthreadJoinCall(const llvm::CallInst *CInst)
+{
+    // TODO later change this to create join node and set data correctly
+    // we need just to create one node;
+    // undefined call is overapproximation, so its ok
+    RWNode *node = createUnknownCall(CInst);
+    threadJoinCalls.emplace(CInst, node);
+    return node;
+}
+
+RWNode *LLVMReadWriteGraphBuilder::createPthreadExitCall(const llvm::CallInst *CInst)
+{
+    return createReturn(CInst);
+}
+*/
 
 
-} // namespace pta
+} // namespace dda
 } // namespace dg
-
