@@ -246,8 +246,12 @@ void getFileLineCriteriaNodes(LLVMDependenceGraph& dg,
                         continue;
                     const llvm::DILocation *dil = Loc.get();
                     std::string filename = dil->getFilename().str();
-                    if(filename != c.filename)
-                        continue;
++                    auto list1 = splitList(filename, '/');
++                    std::string name1=list1[list1.size()-1];
++                    auto list2 = splitList(c.filename, '/');
++                    std::string name2=list2[list2.size()-1];
++                    if(name1.compare(name2)!=0)
+                         continue;
                     if (isStoreToTheVar(dg, I, c.varname) || isLoadOfTheVar(dg, I, c.varname || !c.varname.compare("NULL"))) {
                             llvm::errs() << "Matched file " << c.filename << " with linecnt "<< c.linenum <<" var "<<c.varname<< " to:\n" << I << "\n";
                             LLVMNode *nd = it.second->getNode(&I);
